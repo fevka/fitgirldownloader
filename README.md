@@ -13,3 +13,8 @@ Modifications: We accept no liability for actions taken using either the origina
 By using this software, you acknowledge that you are solely responsible for compliance with any relevant laws and terms of service.
 
 
+> **Disclaimer:** This tool only automates the download process for content
+> hosted on third-party file hosters. The authors do not host, distribute, or
+> promote any copyrighted content. You are responsible for using this software
+> in accordance with your local laws and the terms of service of the sites it
+> interacts with.
