@@ -51,7 +51,13 @@ fn get_links_from_page(html: &str) -> Result<Vec<String>, String> {
 
     let file_hoster = Selector::parse("div.entry-content ul > li:nth-child(2) > a")
         .map_err(|e| format!("Selector: {}", e))?;
-    let tags = document.select(&file_hoster).collect::<Vec<_>>();
+    let tags: Vec<_> = document
+        .select(&file_hoster)
+        .filter(|t| {
+            let text = t.text().collect::<String>();
+            text.contains("Filehoster: FuckingFast")
+        })
+        .collect();
 
     if tags.is_empty() {
         return Err("fuckingfast linki bulunamadı".into());
@@ -81,7 +87,11 @@ fn get_links_from_page(html: &str) -> Result<Vec<String>, String> {
             }
         }
     }
-    results.sort();
+    results.sort_by(|a, b| {
+        let af = a.split('#').nth(1).unwrap_or(a);
+        let bf = b.split('#').nth(1).unwrap_or(b);
+        af.cmp(bf)
+    });
     results.dedup();
     Ok(results)
 }
@@ -122,27 +132,83 @@ const RESOLVER_JS: &str = r#"
   if (window.__ff_resolver_started) return;
   window.__ff_resolver_started = true;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const dbg = (s) => {
+    try {
+      document.title = "FF|" + String(s).slice(0, 100);
+    } catch (e) {}
+  };
+  const report = (url) => {
+    try {
+      document.title = "FF_RESOLVED|" + url;
+    } catch (e) {}
+  };
   (async () => {
     try { window.open = function () { return null; }; } catch (e) {}
-    const deadline = Date.now() + 120000;
+    dbg("start");
+    const clickTurnstile = async () => {
+      try {
+        const frames = document.querySelectorAll(
+          "iframe[src*='challenges.cloudflare.com'], iframe[src*='challenges.cloudflare']"
+        );
+        for (const f of frames) {
+          try {
+            const rect = f.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+              const doc = f.contentDocument;
+              if (doc) {
+                const cb = doc.querySelector("input[type='checkbox'], .cf-turnstile input, label[role='checkbox']");
+                if (cb) { cb.click(); dbg("turnstile_clicked"); }
+              }
+            }
+          } catch (e) {}
+        }
+        const widget = document.querySelector(".cf-turnstile");
+        if (widget) {
+          const box = widget.querySelector("iframe");
+          if (box) {
+            const rect = box.getBoundingClientRect();
+            box.dispatchEvent(new MouseEvent("click", {
+              bubbles: true, cancelable: true, view: window,
+              clientX: rect.left + rect.width / 2,
+              clientY: rect.top + rect.height / 2
+            }));
+            dbg("turnstile_box_click");
+          }
+        }
+      } catch (e) {}
+    };
+    await clickTurnstile();
     let btn = null;
+    const deadline = Date.now() + 120000;
+    const selectors = [
+      "a.gay-button",
+      "button.gay-button",
+      "a[class*='gay-button']",
+      "a[href*='/f/']"
+    ];
     while (Date.now() < deadline) {
-      btn = document.querySelector("a.gay-button");
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) { btn = el; break; }
+      }
       if (btn) {
         const html = btn.outerHTML || "";
-        if (!/opacity\s*:\s*0\.5|not-allowed/.test(html)) break;
+        const disabled = /not-allowed|opacity\s*:\s*0\.[0-4]|disabled/i.test(html);
+        if (!disabled) { dbg("btn_ready"); break; }
       }
+      if (Date.now() % 6000 < 400) await clickTurnstile();
       await sleep(400);
     }
-    if (!btn) return;
+    if (!btn) { dbg("no_button"); return; }
     try { btn.click(); } catch (e) {}
+    dbg("clicked");
     const dlDeadline = Date.now() + 20000;
     while (Date.now() < dlDeadline) {
-      if ((document.cookie || "").indexOf("dlpass") !== -1) break;
+      if ((document.cookie || "").indexOf("dlpass") !== -1) { dbg("dlpass_ok"); break; }
       await sleep(300);
     }
     const fileId = (location.pathname || "").replace(/^\//, "");
-    const goUrl = location.origin + "/f/" + fileId + "/go";
+    const goUrl = "https://fuckingfast.co/f/" + fileId + "/go";
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
         const resp = await fetch(goUrl, {
@@ -150,20 +216,24 @@ const RESOLVER_JS: &str = r#"
           headers: {
             "HX-Request": "true",
             "HX-Current-URL": location.href,
-            "Origin": location.origin,
+            "Origin": "https://fuckingfast.co",
             "Content-Type": "application/x-www-form-urlencoded"
           },
           body: ""
         });
         const hx = resp.headers.get("HX-Redirect") || resp.headers.get("hx-redirect");
+        dbg("fetch_" + resp.status + (hx ? "_hx" : "_nohx"));
         if (hx) {
-          const url = hx.startsWith("/") ? location.origin + hx : hx;
-          window.location.href = url;
+          const url = hx.startsWith("/") ? "https://fuckingfast.co" + hx : hx;
+          report(url);
           return;
         }
-      } catch (e) {}
+      } catch (e) {
+        dbg("fetch_err_" + String(e).slice(0, 60));
+      }
       await sleep(1000);
     }
+    dbg("give_up");
   })();
 })();
 "#;
@@ -175,6 +245,7 @@ async fn wait_resolver(
 ) -> Result<String, String> {
     let t0 = tokio::time::Instant::now();
     let mut shown = false;
+    let mut last_title = String::new();
     loop {
         let elapsed = t0.elapsed();
         if elapsed >= Duration::from_secs(360) {
@@ -196,6 +267,17 @@ async fn wait_resolver(
                 None => return Err("resolver kapatıldı".to_string()),
             },
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                if let Ok(t) = window.title() {
+                    if t != last_title {
+                        last_title = t.clone();
+                        debug_log(&format!("resolver title: {}", t));
+                        if let Some(rest) = t.strip_prefix("FF_RESOLVED|") {
+                            if !rest.is_empty() {
+                                return Ok(rest.to_string());
+                            }
+                        }
+                    }
+                }
                 if check_ctrl(link) == CtrlState::Cancelled {
                     return Err("Cancelled".into());
                 }
@@ -233,6 +315,15 @@ async fn resolve_via_webview(app: &AppHandle, link: &str) -> Result<String, Stri
             move |u| {
                 debug_log(&format!("nav: {}", u));
                 if let Some(host) = u.host_str() {
+                    if host == "ff-dbg.local" {
+                        let msg = u
+                            .query_pairs()
+                            .find(|(k, _)| k == "m")
+                            .map(|(_, v)| v.to_string())
+                            .unwrap_or_default();
+                        debug_log(&format!("resolver: {}", msg));
+                        return false;
+                    }
                     if host == "dl.fuckingfast.co" || host.ends_with(".fuckingfast.co") {
                         let _ = tx.send(u.to_string());
                         return false;
