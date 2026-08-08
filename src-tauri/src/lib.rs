@@ -429,27 +429,42 @@ const MAX_RETRIES: u32 = 5;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 async fn probe_total(dl_url: &str) -> u64 {
+    debug_log(&format!("probe: {}", dl_url));
     let uri: http::Uri = match dl_url.parse() {
         Ok(u) => u,
-        Err(_) => return 0,
+        Err(e) => {
+            debug_log(&format!("probe URI hata: {}", e));
+            return 0;
+        }
     };
     let mut req = wreq::Request::new(Method::GET, uri);
     req.headers_mut()
         .insert("Range", HeaderValue::from_static("bytes=0-0"));
     let resp = match HTTP_CLIENT.execute(req).await {
         Ok(r) => r,
-        Err(_) => return 0,
+        Err(e) => {
+            debug_log(&format!("probe HTTP hata: {}", e));
+            return 0;
+        }
     };
     if resp.status() != 206 {
+        debug_log(&format!("probe status: {} (206 degil)", resp.status()));
         return 0;
     }
     match resp.headers().get("Content-Range") {
-        Some(cr) => cr
-            .to_str()
-            .ok()
-            .and_then(|s| s.rsplit('/').next()?.parse::<u64>().ok())
-            .unwrap_or(0),
-        None => 0,
+        Some(cr) => {
+            let v = cr
+                .to_str()
+                .ok()
+                .and_then(|s| s.rsplit('/').next()?.parse::<u64>().ok())
+                .unwrap_or(0);
+            debug_log(&format!("probe total: {} B", v));
+            v
+        }
+        None => {
+            debug_log("probe Content-Range yok");
+            0
+        }
     }
 }
 
@@ -502,6 +517,11 @@ async fn download_part(
 
         let ranged = resp.status() == 206;
         if !ranged && !resp.status().is_success() {
+            debug_log(&format!(
+                "part [{start}-{end}] HTTP {} (attempt {})",
+                resp.status(),
+                attempt
+            ));
             if attempt == MAX_RETRIES {
                 return Err(format!("HTTP {}", resp.status()));
             }
@@ -683,11 +703,13 @@ async fn parallel_download(link: String, dl_url: String, sp: String, total: u64,
         match h.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
+                debug_log(&format!("part HATA: {}", e));
                 if any_err.is_none() {
                     any_err = Some(e);
                 }
             }
             Err(_) => {
+                debug_log("part panicked");
                 if any_err.is_none() {
                     any_err = Some("part task panicked".into());
                 }
@@ -698,6 +720,7 @@ async fn parallel_download(link: String, dl_url: String, sp: String, total: u64,
 
     match any_err {
         Some(e) => {
+            debug_log(&format!("parallel_download HATA: {}", e));
             PROGRESS
                 .lock()
                 .unwrap()
@@ -708,6 +731,7 @@ async fn parallel_download(link: String, dl_url: String, sp: String, total: u64,
             }
         }
         None => {
+            debug_log("parallel_download TAMAM");
             PROGRESS
                 .lock()
                 .unwrap()
@@ -721,6 +745,7 @@ async fn single_download(link: String, dl_url: String, sp: String, total: u64) {
     let uri: http::Uri = match dl_url.parse() {
         Ok(u) => u,
         Err(e) => {
+            debug_log(&format!("single URI hata: {}", e));
             PROGRESS
                 .lock()
                 .unwrap()
@@ -734,6 +759,7 @@ async fn single_download(link: String, dl_url: String, sp: String, total: u64) {
     let resp = match HTTP_CLIENT.execute(req).await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
+            debug_log(&format!("single HTTP {} ({} B)", r.status(), r.content_length().unwrap_or(0)));
             PROGRESS
                 .lock()
                 .unwrap()
@@ -742,6 +768,7 @@ async fn single_download(link: String, dl_url: String, sp: String, total: u64) {
             return;
         }
         Err(e) => {
+            debug_log(&format!("single HTTP hata: {}", e));
             PROGRESS
                 .lock()
                 .unwrap()
@@ -754,6 +781,7 @@ async fn single_download(link: String, dl_url: String, sp: String, total: u64) {
     let mut file = match tokio::fs::File::create(&sp).await {
         Ok(f) => f,
         Err(e) => {
+            debug_log(&format!("single file create hata: {}", e));
             PROGRESS
                 .lock()
                 .unwrap()
@@ -851,6 +879,7 @@ async fn single_download(link: String, dl_url: String, sp: String, total: u64) {
 
 #[tauri::command]
 async fn start_download(app: AppHandle, link: String, save_dir: String, parts: u64) -> Result<String, String> {
+    debug_log(&format!("start_download: {} parts={}", link, parts));
     PROGRESS.lock().unwrap().insert(
         link.clone(),
         ProgState {
@@ -864,7 +893,14 @@ async fn start_download(app: AppHandle, link: String, save_dir: String, parts: u
     );
     CTRL.lock().unwrap().insert(link.clone(), CtrlState::Running);
 
-    let (dl_url, filename) = resolve_download_url(&app, &link).await?;
+    let (dl_url, filename) = match resolve_download_url(&app, &link).await {
+        Ok(v) => v,
+        Err(e) => {
+            debug_log(&format!("resolve HATA: {}", e));
+            return Err(e);
+        }
+    };
+    debug_log(&format!("resolve OK: {} -> {}", filename, dl_url));
     let save_path = std::path::Path::new(&save_dir).join(&filename);
     let sp = save_path.to_string_lossy().to_string();
     PROGRESS
@@ -876,10 +912,13 @@ async fn start_download(app: AppHandle, link: String, save_dir: String, parts: u
     let link_c = link.clone();
     tokio::spawn(async move {
         let total = probe_total(&dl_url).await;
+        debug_log(&format!("probe_total: {} B", total));
         let parts = parts.clamp(1, 16);
         if total == 0 || parts <= 1 {
+            debug_log("single_download basliyor");
             single_download(link_c, dl_url, sp, total).await;
         } else {
+            debug_log(&format!("parallel_download basliyor parts={}", parts));
             parallel_download(link_c, dl_url, sp, total, parts).await;
         }
     });
