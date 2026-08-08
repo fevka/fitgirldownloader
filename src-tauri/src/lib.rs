@@ -17,6 +17,7 @@ struct ProgState {
     error: Option<String>,
     paused: bool,
     sp: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(PartialEq, Clone)]
@@ -44,6 +45,7 @@ struct DownloadInfo {
     total: u64,
     error: Option<String>,
     paused: bool,
+    status: Option<String>,
 }
 
 fn get_links_from_page(html: &str) -> Result<Vec<String>, String> {
@@ -275,6 +277,13 @@ async fn wait_resolver(
                             if !rest.is_empty() {
                                 return Ok(rest.to_string());
                             }
+                        } else if let Some(rest) = t.strip_prefix("FF|") {
+                            let msg = human_status(rest.trim()).to_string();
+                            PROGRESS
+                                .lock()
+                                .unwrap()
+                                .get_mut(link)
+                                .map(|s| s.status = Some(msg));
                         }
                     }
                 }
@@ -538,9 +547,13 @@ async fn download_part(
 
         let mut f = tokio::fs::OpenOptions::new()
             .write(true)
+            .create(true)
             .open(&sp)
             .await
-            .map_err(|e| format!("Open: {}", e))?;
+            .map_err(|e| {
+                debug_log(&format!("part open hata: {} sp={}", e, sp));
+                format!("Open: {}", e)
+            })?;
         AsyncSeekExt::seek(&mut f, std::io::SeekFrom::Start(from))
             .await
             .map_err(|e| format!("Seek: {}", e))?;
@@ -625,9 +638,11 @@ async fn download_part(
 }
 
 async fn parallel_download(link: String, dl_url: String, sp: String, total: u64, parts: u64) {
+    debug_log(&format!("parallel: sp={}", sp));
     let file = match tokio::fs::File::create(&sp).await {
         Ok(f) => f,
         Err(e) => {
+            debug_log(&format!("parallel File::create hata: {}", e));
             PROGRESS
                 .lock()
                 .unwrap()
@@ -637,8 +652,17 @@ async fn parallel_download(link: String, dl_url: String, sp: String, total: u64,
         }
     };
     // Dosyayı önceden boyutlandır ki parçalar bağımsız offset'lere yazsın.
-    let _ = file.set_len(total).await;
+    if let Err(e) = file.set_len(total).await {
+        debug_log(&format!("set_len hata: {}", e));
+        PROGRESS
+            .lock()
+            .unwrap()
+            .get_mut(&link)
+            .map(|s| s.error = Some(format!("SetLen: {}", e)));
+        return;
+    }
     drop(file);
+    debug_log(&format!("dosya hazir: {} ({} B)", sp, total));
     PROGRESS
         .lock()
         .unwrap()
@@ -877,6 +901,20 @@ async fn single_download(link: String, dl_url: String, sp: String, total: u64) {
         .map(|s| s.progress = 100.0);
 }
 
+fn human_status(code: &str) -> &str {
+    match code {
+        "start" => "Cloudflare kontrol ediliyor...",
+        "turnstile_clicked" => "Doğrulama kutusu tıklanıyor...",
+        "turnstile_box_click" => "Doğrulama çözülüyor...",
+        "btn_ready" => "İndirme butonu hazır, tıklanıyor...",
+        "clicked" => "Buton tıklandı, bekleniyor...",
+        "dlpass_ok" => "Oturum çerezi alındı, link çözülüyor...",
+        "no_button" => "İndirme butonu bulunamadı!",
+        "give_up" => "Çözüm başarısız oldu!",
+        _ => "Link çözülüyor...",
+    }
+}
+
 #[tauri::command]
 async fn start_download(app: AppHandle, link: String, save_dir: String, parts: u64) -> Result<String, String> {
     debug_log(&format!("start_download: {} parts={}", link, parts));
@@ -889,6 +927,7 @@ async fn start_download(app: AppHandle, link: String, save_dir: String, parts: u
             error: None,
             paused: false,
             sp: None,
+            status: Some("Link çözülüyor (Cloudflare)...".into()),
         },
     );
     CTRL.lock().unwrap().insert(link.clone(), CtrlState::Running);
@@ -901,6 +940,11 @@ async fn start_download(app: AppHandle, link: String, save_dir: String, parts: u
         }
     };
     debug_log(&format!("resolve OK: {} -> {}", filename, dl_url));
+    PROGRESS
+        .lock()
+        .unwrap()
+        .get_mut(&link)
+        .map(|s| s.status = Some("İndirme hazırlanıyor...".into()));
     let save_path = std::path::Path::new(&save_dir).join(&filename);
     let sp = save_path.to_string_lossy().to_string();
     PROGRESS
@@ -922,6 +966,11 @@ async fn start_download(app: AppHandle, link: String, save_dir: String, parts: u
             parallel_download(link_c, dl_url, sp, total, parts).await;
         }
     });
+    PROGRESS
+        .lock()
+        .unwrap()
+        .get_mut(&link)
+        .map(|s| s.status = None);
 
     Ok(filename)
 }
@@ -936,6 +985,7 @@ async fn get_download_progress(link: String) -> Result<DownloadInfo, String> {
             total: s.total,
             error: s.error.clone(),
             paused: s.paused,
+            status: s.status.clone(),
         })
     } else {
         Ok(DownloadInfo {
@@ -944,6 +994,7 @@ async fn get_download_progress(link: String) -> Result<DownloadInfo, String> {
             total: 0,
             error: None,
             paused: false,
+            status: None,
         })
     }
 }

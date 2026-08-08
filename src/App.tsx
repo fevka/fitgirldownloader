@@ -48,6 +48,7 @@ interface DownloadItem {
   error?: string;
   speed?: number;
   checked: boolean;
+  resolverMsg?: string;
 }
 
 function App() {
@@ -149,9 +150,47 @@ function App() {
     []
   );
 
-  const pollProgress = async (link: string, idx: number) => {
+  const pollProgress = async (link: string, idx: number, startPromise: Promise<string>) => {
+    let fileName: string | null = null;
+    let resolveDone = false;
+    let resolveErr: unknown = null;
+    startPromise.then(
+      (n) => {
+        fileName = n;
+        resolveDone = true;
+      },
+      (e) => {
+        resolveErr = e;
+        resolveDone = true;
+      }
+    );
+
     while (true) {
       await new Promise((r) => setTimeout(r, 500));
+
+      if (!resolveDone) {
+        const info = await invoke<{
+          progress: number;
+          downloaded: number;
+          total: number;
+          error: string | null;
+          paused: boolean;
+          status: string | null;
+        }>("get_download_progress", { link });
+        if (info.status) {
+          setItemStatus(idx, { status: "resolving", resolverMsg: info.status });
+        }
+        continue;
+      }
+
+      if (resolveErr) {
+        if (cancelRef.current) {
+          setItemStatus(idx, { status: "pending", progress: 0, downloaded: 0, error: undefined, resolverMsg: undefined });
+        } else {
+          setItemStatus(idx, { status: "error", error: String(resolveErr), resolverMsg: undefined });
+        }
+        return;
+      }
 
       const info = await invoke<{
         progress: number;
@@ -159,14 +198,15 @@ function App() {
         total: number;
         error: string | null;
         paused: boolean;
+        status: string | null;
       }>("get_download_progress", { link });
 
       if (info.error) {
         speedRef.current.delete(link);
         if (info.error === "Cancelled") {
-          setItemStatus(idx, { status: "pending", progress: 0, downloaded: 0, error: undefined, speed: 0 });
+          setItemStatus(idx, { status: "pending", progress: 0, downloaded: 0, error: undefined, speed: 0, resolverMsg: undefined });
         } else {
-          setItemStatus(idx, { status: "error", error: info.error!, progress: 0, downloaded: 0, speed: 0 });
+          setItemStatus(idx, { status: "error", error: info.error!, progress: 0, downloaded: 0, speed: 0, resolverMsg: undefined });
         }
         return;
       }
@@ -190,10 +230,12 @@ function App() {
         speedRef.current.set(link, { downloaded: info.downloaded, time: now, ema });
         setItemStatus(idx, {
           status: info.paused ? "paused" : "downloading",
+          file_name: fileName ?? undefined,
           progress: info.progress,
           downloaded: info.downloaded,
           totalBytes: info.total,
           speed: info.paused ? 0 : ema,
+          resolverMsg: undefined,
         });
       }
 
@@ -211,20 +253,13 @@ function App() {
       setItemStatus(idx, { status: "resolving" });
 
       try {
-        const fileName = await invoke<string>("start_download", {
+        const startPromise = invoke<string>("start_download", {
           link,
           saveDir: downloadDir,
           parts: connections,
         });
 
-        if (cancelRef.current) {
-          setItemStatus(idx, { status: "pending", progress: 0, downloaded: 0, error: undefined });
-          return;
-        }
-
-        setItemStatus(idx, { status: "downloading", file_name: fileName });
-
-        await pollProgress(link, idx);
+        await pollProgress(link, idx, startPromise);
 
         setItems((prev) => {
           const item = prev[idx];
@@ -237,9 +272,9 @@ function App() {
         });
       } catch (e) {
         if (cancelRef.current) {
-          setItemStatus(idx, { status: "pending", progress: 0, downloaded: 0, error: undefined });
+          setItemStatus(idx, { status: "pending", progress: 0, downloaded: 0, error: undefined, resolverMsg: undefined });
         } else {
-          setItemStatus(idx, { status: "error", error: String(e) });
+          setItemStatus(idx, { status: "error", error: String(e), resolverMsg: undefined });
         }
       } finally {
         invoke("clear_download", { link }).catch(() => {});
@@ -479,6 +514,9 @@ function App() {
                   </span>
                 </div>
                 {item.error && <div className="item-error">{item.error}</div>}
+                {item.resolverMsg && item.status === "resolving" && (
+                  <div className="item-resolver">{item.resolverMsg}</div>
+                )}
               </div>
             ))}
           </div>
